@@ -21,23 +21,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * SpeechCaptureService — realtime subtitle pipeline with auto-reconnect
- *
- * Audio pipeline (sliding-window, minimal latency):
- *   1. Accumulate 1.5 s of 16 kHz mono PCM
- *   2. Send to whisper_server.py immediately
- *   3. Slide forward by 1.0 s (keep 0.5 s overlap for context continuity)
- *   4. Two parallel whisper workers so a slow chunk never blocks the next one
- *   5. De-duplicate consecutive identical results before pushing to overlay
- *
- * Reconnect strategy:
- *   • Every failed whisper call increments a consecutive-error counter.
- *   • At 3 consecutive errors → enter reconnect mode, pause sending chunks.
- *   • Poll /health every 2 s → 4 s → 8 s (exponential backoff, capped at 8 s).
- *   • Once /health returns 200 → resume immediately, notify Flutter UI.
- *   • Watchdog: if no success for 15 s → force reconnect check automatically.
- */
 class SpeechCaptureService : Service() {
 
     companion object {
@@ -57,19 +40,18 @@ class SpeechCaptureService : Service() {
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
         private const val WHISPER_HEALTH = "http://127.0.0.1:8765/health"
 
-        // ── Audio timing ──────────────────────────────────────────────────────
-        private const val CHUNK_SECS    = 1.5
-        private const val STRIDE_SECS   = 1.0
+        private const val CHUNK_SECS    = 1.0
+        private const val STRIDE_SECS   = 1.0   // no overlap
 
-        private const val CHUNK_SAMPLES  = (SAMPLE_RATE * CHUNK_SECS).toInt()   // 24 000
+        private const val CHUNK_SAMPLES  = (SAMPLE_RATE * CHUNK_SECS).toInt()   // 16 000
         private const val STRIDE_SAMPLES = (SAMPLE_RATE * STRIDE_SECS).toInt()  // 16 000
-        private const val CHUNK_BYTES    = CHUNK_SAMPLES  * 2                   // 48 000
+        private const val CHUNK_BYTES    = CHUNK_SAMPLES  * 2                   // 32 000
         private const val STRIDE_BYTES   = STRIDE_SAMPLES * 2                   // 32 000
 
-        // ── Reconnect thresholds ──────────────────────────────────────────────
-        private const val MAX_CONSECUTIVE_ERRORS = 3       // failures before reconnect mode
-        private const val WATCHDOG_TIMEOUT_MS    = 15_000L // no success → force check
-        private const val MAX_BACKOFF_MS         = 8_000L  // cap on health-poll interval
+        private const val STALE_THRESHOLD_MS     = 1_500L
+        private const val MAX_CONSECUTIVE_ERRORS = 5
+        private const val WATCHDOG_TIMEOUT_MS    = 20_000L
+        private const val MAX_BACKOFF_MS         = 8_000L
     }
 
     private val mainHandler   = Handler(Looper.getMainLooper())
@@ -79,20 +61,17 @@ class SpeechCaptureService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var wakeLock:      PowerManager.WakeLock? = null
 
-    // Two workers so a slow chunk never blocks the next one
-    private val whisperExecutor = Executors.newFixedThreadPool(2)
+    // Single worker — no CPU contention
+    private val whisperExecutor = Executors.newSingleThreadExecutor()
 
     private var lastPushedHindi = ""
     private val lastPushMs      = AtomicLong(0L)
 
-    // ── Reconnect state ───────────────────────────────────────────────────────
     private val consecutiveErrors  = AtomicInteger(0)
     @Volatile private var reconnecting      = false
     private var reconnectBackoffMs          = 2_000L
     private var reconnectRunnable: Runnable? = null
     private var watchdogRunnable:  Runnable? = null
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
@@ -195,8 +174,6 @@ class SpeechCaptureService : Service() {
         super.onDestroy()
     }
 
-    // ── Audio capture — sliding-window loop ───────────────────────────────────
-
     private fun startCapture() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             OverlayService.updateText("", "Android 10 or newer required.")
@@ -256,7 +233,7 @@ class SpeechCaptureService : Service() {
         ar.startRecording()
         updateNotification("Translating video audio to Hindi…")
         OverlayService.updateText("", "Listening to video audio…")
-        Log.d(TAG, "Capture started — chunk=${CHUNK_SECS}s stride=${STRIDE_SECS}s buf=$bufSize")
+        Log.d(TAG, "Capture started — chunk=${CHUNK_SECS}s stride=${STRIDE_SECS}s (no overlap) buf=$bufSize")
 
         captureThread = Thread({
             val window  = ByteArray(CHUNK_BYTES)
@@ -284,15 +261,13 @@ class SpeechCaptureService : Service() {
                     src    += toCopy
 
                     if (filled >= CHUNK_BYTES) {
-                        // Skip sending while reconnecting — don't flood a recovering server
                         if (!reconnecting && !whisperExecutor.isShutdown) {
                             val payload = window.copyOf(CHUNK_BYTES)
-                            whisperExecutor.submit { sendToWhisper(payload) }
+                            val stampMs = System.currentTimeMillis()
+                            whisperExecutor.submit { sendToWhisper(payload, stampMs) }
                         }
-
-                        val overlap = CHUNK_BYTES - STRIDE_BYTES
-                        System.arraycopy(window, STRIDE_BYTES, window, 0, overlap)
-                        filled = overlap
+                        // No overlap — fully reset window
+                        filled = 0
                     }
                 }
             }
@@ -304,9 +279,14 @@ class SpeechCaptureService : Service() {
         }
     }
 
-    // ── Whisper HTTP call ─────────────────────────────────────────────────────
+    private fun sendToWhisper(pcmBytes: ByteArray, stampMs: Long) {
+        // Discard stale audio before making HTTP call
+        val ageMs = System.currentTimeMillis() - stampMs
+        if (ageMs > STALE_THRESHOLD_MS) {
+            Log.d(TAG, "Discarding stale audio chunk (${ageMs}ms old)")
+            return
+        }
 
-    private fun sendToWhisper(pcmBytes: ByteArray) {
         try {
             val wavBytes = pcmToWav(pcmBytes)
 
@@ -314,9 +294,10 @@ class SpeechCaptureService : Service() {
             conn.requestMethod  = "POST"
             conn.setRequestProperty("Content-Type",   "audio/wav")
             conn.setRequestProperty("Content-Length", wavBytes.size.toString())
+            conn.setRequestProperty("Connection",     "keep-alive")
             conn.doOutput       = true
-            conn.connectTimeout = 4_000   // fast-fail if Termux crashed
-            conn.readTimeout    = 12_000  // tiny model; give ample headroom
+            conn.connectTimeout = 2_000   // fast-fail; ThreadingHTTPServer accepts instantly
+            conn.readTimeout    = 12_000
 
             conn.outputStream.use { it.write(wavBytes) }
 
@@ -329,12 +310,19 @@ class SpeechCaptureService : Service() {
 
             val body      = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
             val json      = JSONObject(body)
-            val hindiText = json.optString("text",        "").trim()
-            val srcText   = json.optString("source_text", "").trim()
-            val lang      = json.optString("language",    "")
+
+            // Server-side stale-drop — not an error
+            val dropped = json.optBoolean("dropped", false)
+            if (dropped) {
+                Log.d(TAG, "Server dropped stale job — skipping")
+                return
+            }
+
+            val hindiText  = json.optString("text",        "").trim()
+            val srcText    = json.optString("source_text", "").trim()
+            val lang       = json.optString("language",    "")
             val confidence = json.optDouble("confidence",  0.0)
 
-            // ── SUCCESS — reset error state ───────────────────────────────────
             consecutiveErrors.set(0)
             if (reconnecting) {
                 reconnecting       = false
@@ -347,12 +335,11 @@ class SpeechCaptureService : Service() {
                 }
             }
             lastPushMs.set(System.currentTimeMillis())
-            scheduleWatchdog()   // reset watchdog on each success
+            scheduleWatchdog()
 
             if (hindiText.length < 2 || hindiText == lastPushedHindi) return
 
-            Log.d(TAG,
-                "Whisper [$lang / ${(confidence * 100).toInt()}%] → HI: ${hindiText.take(60)}")
+            Log.d(TAG, "Whisper [$lang / ${(confidence * 100).toInt()}%] → HI: ${hindiText.take(60)}")
 
             lastPushedHindi = hindiText
             latestOriginal  = srcText
@@ -370,9 +357,6 @@ class SpeechCaptureService : Service() {
         }
     }
 
-    // ── Reconnect logic ───────────────────────────────────────────────────────
-
-    /** Increment error counter; enter reconnect mode at threshold. */
     private fun handleWhisperFailure(reason: String) {
         val errors = consecutiveErrors.incrementAndGet()
         Log.w(TAG, "Whisper error #$errors: $reason")
@@ -389,7 +373,6 @@ class SpeechCaptureService : Service() {
         }
     }
 
-    /** Schedule next /health poll with exponential backoff: 2 s → 4 s → 8 s. */
     private fun scheduleReconnectPoll() {
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
 
@@ -402,15 +385,14 @@ class SpeechCaptureService : Service() {
         Log.d(TAG, "Next whisper health poll in ${delay}ms")
     }
 
-    /** Ping /health; resume on 200, schedule next poll on failure. */
     private fun pollWhisperHealth() {
         if (!capturing.get()) return
         whisperExecutor.submit {
             val alive = try {
                 val conn = URL(WHISPER_HEALTH).openConnection() as HttpURLConnection
                 conn.requestMethod  = "GET"
-                conn.connectTimeout = 3_000
-                conn.readTimeout    = 3_000
+                conn.connectTimeout = 1_500
+                conn.readTimeout    = 1_500
                 val code = conn.responseCode
                 conn.disconnect()
                 code == 200
@@ -432,11 +414,6 @@ class SpeechCaptureService : Service() {
         }
     }
 
-    /**
-     * Watchdog: if no successful translation arrives for WATCHDOG_TIMEOUT_MS
-     * (default 15 s), force a reconnect check — covers silent hangs where
-     * whisper is alive but returning empty bodies or timing out mid-response.
-     */
     private fun scheduleWatchdog() {
         watchdogRunnable?.let { mainHandler.removeCallbacks(it) }
         val runnable = Runnable {
@@ -453,8 +430,6 @@ class SpeechCaptureService : Service() {
         watchdogRunnable = runnable
         mainHandler.postDelayed(runnable, WATCHDOG_TIMEOUT_MS)
     }
-
-    // ── PCM → WAV ─────────────────────────────────────────────────────────────
 
     private fun pcmToWav(pcm: ByteArray): ByteArray {
         val channels    = 1
@@ -494,8 +469,6 @@ class SpeechCaptureService : Service() {
         write(v        and 0xff)
         write(v shr 8  and 0xff)
     }
-
-    // ── Notification ──────────────────────────────────────────────────────────
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
