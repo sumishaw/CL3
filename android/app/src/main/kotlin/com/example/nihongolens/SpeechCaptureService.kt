@@ -306,9 +306,7 @@ class SpeechCaptureService : Service() {
         }, "AudioCaptureThread").apply { isDaemon = false; priority = Thread.NORM_PRIORITY; start() }
     }
 
-    private fun _isTooSimilar(a: String, b: String): Boolean {
-        // Returns true if >80% of words in 'a' appear in 'b' — true duplicate
-        // Returns false if content is meaningfully different — show it
+    private fun isTooSimilar(a: String, b: String): Boolean {
         val wordsA = a.trim().split("\\s+".toRegex()).filter { it.length > 1 }.toSet()
         val wordsB = b.trim().split("\\s+".toRegex()).filter { it.length > 1 }.toSet()
         if (wordsA.isEmpty()) return false
@@ -354,19 +352,19 @@ class SpeechCaptureService : Service() {
             lastPushMs.set(System.currentTimeMillis())
             scheduleWatchdog()
 
-            if (hindiText.length < 2) return
+            // Determine what will actually be displayed
+            // (overlay shows Hindi if available, srcText as fallback)
+            val displayText = if (hindiText.length >= 2) hindiText else srcText
+            if (displayText.length < 2) return
 
-            // Smart dedup — skip only if >80% of words overlap with last subtitle.
-            // Exact match was removed (dropped continuation sentences).
-            // But no dedup was causing same sentence to repeat many times.
-            // 80% threshold: allows slight variations, blocks true duplicates.
-            if (lastPushedHindi.isNotEmpty() && _isTooSimilar(hindiText, lastPushedHindi)) {
+            // Smart dedup — skip only if >80% word overlap with last displayed text
+            if (lastPushedHindi.isNotEmpty() && isTooSimilar(displayText, lastPushedHindi)) {
                 Log.d(TAG, "Dedup: too similar to last — skipping")
                 return
             }
 
-            Log.d(TAG, "[$lang/${(confidence*100).toInt()}%] HI: ${hindiText.take(80)}")
-            lastPushedHindi = hindiText
+            Log.d(TAG, "[$lang/${(confidence*100).toInt()}%] display: ${displayText.take(80)}")
+            lastPushedHindi = displayText
             latestOriginal  = srcText; latestEnglish = srcText; latestHindi = hindiText
 
             mainHandler.post {
