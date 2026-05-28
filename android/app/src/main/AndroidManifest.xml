@@ -2,32 +2,18 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.nihongolens">
 
-    <!-- RECORD_AUDIO required by AudioPlaybackCaptureConfiguration even though mic is never opened -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-
-    <!-- Floating overlay over other apps -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-
-    <!-- Foreground service base permission -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-
-    <!-- API 34+: each FGS type needs explicit permission -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-
-    <!-- Keep CPU alive during capture -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-
-    <!-- Show capture progress notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
-    <!-- Battery: ignore optimisations so services survive screen-off -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-
-    <!-- Network: whisper_server.py + LibreTranslate on localhost -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE" />
 
     <application
         android:name="android.app.Application"
@@ -56,11 +42,7 @@
 
         <meta-data android:name="flutterEmbedding" android:value="2" />
 
-        <!--
-            Captures INTERNAL device audio via MediaProjection + AudioPlaybackCapture.
-            Both mediaProjection AND microphone types required on API 34+
-            even when AudioPlaybackCaptureConfiguration is used (no physical mic opened).
-        -->
+        <!-- Internal audio capture via MediaProjection -->
         <service
             android:name=".SpeechCaptureService"
             android:enabled="true"
@@ -76,6 +58,24 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="caption_overlay" />
+        </service>
+
+        <!--
+            LiveCaptionReader — Accessibility Service
+            Reads Android Live Captions text in real-time → translates to Hindi.
+            Must be enabled in Settings > Accessibility > Caption Lens > LiveCaptionReader
+        -->
+        <service
+            android:name=".LiveCaptionReader"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/live_caption_reader_service" />
         </service>
 
     </application>
