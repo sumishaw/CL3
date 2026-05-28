@@ -88,7 +88,6 @@ class LiveCaptionReader : AccessibilityService() {
     }
 
     private fun readFromCaptionWindow(): String? {
-        // Iterate all windows and find the one owned by com.google.android.as
         val allWindows = try { windows } catch (_: Exception) { return null }
         if (allWindows.isNullOrEmpty()) return null
 
@@ -97,12 +96,18 @@ class LiveCaptionReader : AccessibilityService() {
             val windowPkg = root.packageName?.toString() ?: ""
 
             if (windowPkg in LIVE_CAPTION_PACKAGES) {
-                // Found the Live Captions window — extract text from it
-                val text = extractTextFromNode(root)
+                // Collect ALL text nodes from this window
+                val textNodes = mutableListOf<String>()
+                collectAllText(root, textNodes)
                 root.recycle()
-                if (!text.isNullOrBlank() && isValidCaption(text)) {
-                    return text
-                }
+
+                // Filter out known static UI labels
+                val caption = textNodes
+                    .filter { isValidCaption(it) }
+                    .filter { !isStaticUiLabel(it) }
+                    .maxByOrNull { it.length }  // longest valid text = caption
+
+                if (!caption.isNullOrBlank()) return caption
             } else {
                 root.recycle()
             }
@@ -110,37 +115,34 @@ class LiveCaptionReader : AccessibilityService() {
         return null
     }
 
-    private fun extractTextFromNode(node: AccessibilityNodeInfo?): String? {
-        node ?: return null
-        val viewId = node.viewIdResourceName?.lowercase() ?: ""
-        val text   = node.text?.toString()?.trim() ?: ""
+    private fun collectAllText(node: AccessibilityNodeInfo?, out: MutableList<String>) {
+        node ?: return
+        val text = node.text?.toString()?.trim() ?: ""
+        if (text.isNotBlank()) out.add(text)
+        for (i in 0 until node.childCount) collectAllText(node.getChild(i), out)
+    }
 
-        // Check known caption view IDs first
-        val isCaptionNode = listOf(
-            "caption_text", "captiontext", "live_caption",
-            "transcript", "caption_window", "subtitle"
-        ).any { viewId.contains(it) }
-
-        if (isCaptionNode && text.isNotBlank()) return text
-
-        // Also return any non-empty text in this window
-        // (Live Captions window has very few nodes — its main node IS the caption)
-        if (text.length in 3..350) return text
-
-        // Recurse into children
-        for (i in 0 until node.childCount) {
-            val found = extractTextFromNode(node.getChild(i))
-            if (found != null) return found
-        }
-        return null
+    private fun isStaticUiLabel(text: String): Boolean {
+        // Skip language selector labels like "English (United States)"
+        val lower = text.lowercase()
+        if (lower.contains("united states") || lower.contains("united kingdom")) return true
+        if (lower.contains("english") && lower.length < 40) return true
+        if (lower.contains("japanese") && lower.length < 40) return true
+        if (lower.contains("chinese") || lower.contains("korean")) return true
+        if (lower.contains("español") || lower.contains("français")) return true
+        // Skip single words that are likely UI buttons
+        if (!text.contains(" ") && text.length < 15) return true
+        return false
     }
 
     private fun isValidCaption(text: String): Boolean {
-        if (text.length < 3 || text.length > 350) return false
+        if (text.length < 4 || text.length > 350) return false
         val letters = text.count { it.isLetter() }
         if (letters < text.length * 0.4) return false
         if (text.contains("http") || text.contains("www.")) return false
         if (text.contains("com.android") || text.contains("com.google")) return false
+        // Reject locale strings like "English (United States)"
+        if (text.matches(Regex(".*\\(.*\\).*")) && text.length < 50) return false
         return true
     }
 
