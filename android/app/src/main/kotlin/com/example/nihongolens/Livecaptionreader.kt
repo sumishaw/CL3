@@ -40,8 +40,7 @@ class LiveCaptionReader : AccessibilityService() {
         // Prevents infinite deferral during fast continuous speech
         private const val MAX_WAIT_MS     = 3_000L
 
-        @Volatile var isRunning       = false
-        @Volatile var lastCaptionText = ""
+        @Volatile var isRunning  = false
         @Volatile var instance: LiveCaptionReader? = null
     }
 
@@ -79,7 +78,6 @@ class LiveCaptionReader : AccessibilityService() {
         // Clear cached state from previous session
         lastSentText            = ""
         lastHindiOut            = ""
-        lastCaptionText         = ""
         lastTranslatedSentence  = ""
         lastDetectedLang        = ""
         lastRawCaption          = ""
@@ -97,13 +95,12 @@ class LiveCaptionReader : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
         if (pkg !in LIVE_CAPTION_PACKAGES) return
 
-        // CRITICAL FIX: find the com.google.android.as window from the windows list
-        // Do NOT use rootInActiveWindow — that returns the focused window (wrong app)
-        val captionText = readFromCaptionWindow() ?: return
-        if (captionText == lastCaptionText) return
-        lastCaptionText = captionText
-        Log.d(TAG, "Caption: $captionText")
-        scheduleTranslation(captionText)
+        // readFromCaptionWindow handles all dedup internally via lastRawCaption/lastSentSuffix.
+        // Do NOT add an extra lastCaptionText gate here — it causes Caption Lens to stop
+        // when Live Captions is mid-sentence correcting (same send-text, different raw text).
+        val sendText = readFromCaptionWindow() ?: return
+        Log.d(TAG, "Caption: $sendText")
+        scheduleTranslation(sendText)
     }
 
     private var lastTranslatedSentence = ""
@@ -271,10 +268,9 @@ class LiveCaptionReader : AccessibilityService() {
         return true
     }
 
-    private fun scheduleTranslation(text: String) {
-        // Detect language switch — if script changes, clear dedup so first line
-        // of new language is never silently dropped
-        val scriptNow = detectScript(text)
+    private fun scheduleTranslation(sendText: String) {
+        // Detect language switch from the send text script
+        val scriptNow = detectScript(sendText)
         if (scriptNow != lastDetectedLang && lastDetectedLang.isNotEmpty()) {
             lastSentText           = ""
             lastTranslatedSentence = ""
@@ -284,21 +280,25 @@ class LiveCaptionReader : AccessibilityService() {
         }
         lastDetectedLang = scriptNow
 
-        // Debounce: cancel existing 500ms timer, restart it
+        // Debounce: cancel and restart 500ms timer.
+        // When timer fires, send the LATEST sendText captured at that moment —
+        // stored in lastSentSuffix which readFromCaptionWindow already updated.
         pendingJob?.cancel()
         pendingJob = scope.launch {
             delay(DEBOUNCE_MS)
-            enqueueForTranslation(readFromCaptionWindow() ?: lastCaptionText)
+            // Use lastSentSuffix — the most recent processed text from the window
+            val toSend = lastSentSuffix.ifBlank { sendText }
+            enqueueForTranslation(toSend)
         }
 
-        // Force-send: if no force job is running, start one for MAX_WAIT_MS
-        // This fires even if Live Captions keeps updating continuously,
-        // so fast dialogue always produces output every ~3s at minimum
+        // Force-send: guarantee output every MAX_WAIT_MS during continuous speech.
+        // Only start a new force job if none is running.
         if (forceJob == null || forceJob?.isActive == false) {
             forceJob = scope.launch {
                 delay(MAX_WAIT_MS)
-                pendingJob?.cancel()   // cancel the debounce — we're sending now
-                enqueueForTranslation(readFromCaptionWindow() ?: lastCaptionText)
+                pendingJob?.cancel()
+                val toSend = lastSentSuffix.ifBlank { sendText }
+                enqueueForTranslation(toSend)
             }
         }
     }
