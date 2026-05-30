@@ -158,6 +158,17 @@ class MainActivity : FlutterActivity() {
                         "hindi"    to SpeechCaptureService.latestHindi
                     ))
 
+                "getLogs" -> {
+                    // Return last 200 lines from the in-memory log queue as a string
+                    val lines = CaptionLogger.getRecentLines(200)
+                    result.success(lines)
+                }
+
+                "clearLogs" -> {
+                    CaptionLogger.clearLines()
+                    result.success(true)
+                }
+
                 else -> result.notImplemented()
             }
         }
