@@ -95,6 +95,10 @@ class OverlayService : Service() {
         running      = false
         pushCallback = null
         mainHandler.removeCallbacksAndMessages(null)
+        lines.clear()
+        displayQueue.clear()
+        flipScheduled = false
+        lastHindi     = ""
         if (viewAdded) {
             try { windowManager?.removeView(overlayView) } catch (_: Exception) {}
             viewAdded = false
