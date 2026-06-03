@@ -110,22 +110,22 @@ class OverlayService : Service() {
     private fun onPush(hindi: String) {
         if (hindi.isBlank()) return
         val t = hindi.trim()
-        // Skip exact duplicate when queue is empty — no point showing same text again
         if (t == currentText && queue.isEmpty()) { reschedSilence(); return }
 
         val token = tokenCounter.incrementAndGet()
         queue.addLast(Item(token, t))   // FIFO
         reschedSilence()
-        if (!showing) advance()          // kick display if idle
+
+        // Always advance immediately when new content arrives —
+        // mirrors UI subtitle which updates on every new translation
+        advance()
     }
 
     private fun onClear() {
-        // Advance expectedToken past all pending — stale items skipped in advance()
         expectedToken = tokenCounter.get() + 1
         queue.clear()
         cancelTimer()
-        showing = false   // allow next onPush to kick display immediately
-        android.util.Log.d("Overlay", "cleared expectedToken=$expectedToken")
+        showing = false
     }
 
     // ── Display loop ──────────────────────────────────────────────────────────
@@ -138,7 +138,8 @@ class OverlayService : Service() {
             queue.removeFirst()
 
         if (queue.isEmpty()) {
-            showing = false   // ← CRITICAL: lets next onPush() kick display
+            // Nothing new — if already showing something, keep it visible
+            // until silence timer clears it. Don't reset showing here.
             return
         }
 
@@ -149,15 +150,19 @@ class OverlayService : Service() {
         showing     = true
         display(item.text)
 
-        val cap    = item.token
-        val waitMs = if (queue.size >= 3) READ_MS_BACKLOG else READ_MS_NORMAL
-        readRunnable = Runnable {
-            readRunnable = null
-            if (!running) return@Runnable
-            if (cap < expectedToken) { showing = false; return@Runnable }
-            advance()
+        // Only schedule a timer if MORE items are still queued —
+        // advances through backlog at READ_MS_BACKLOG pace.
+        // If this is the last item, no timer — silence timer will clear it.
+        if (queue.isNotEmpty()) {
+            val cap = item.token
+            readRunnable = Runnable {
+                readRunnable = null
+                if (!running) return@Runnable
+                if (cap < expectedToken) { showing = false; return@Runnable }
+                advance()
+            }
+            handler.postDelayed(readRunnable!!, READ_MS_BACKLOG)
         }
-        handler.postDelayed(readRunnable!!, waitMs)
     }
 
     private fun cancelTimer() {
