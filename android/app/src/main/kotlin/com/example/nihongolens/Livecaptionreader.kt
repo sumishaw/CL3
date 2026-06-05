@@ -347,8 +347,8 @@ class LiveCaptionReader : AccessibilityService() {
                 if (hNorm == norm(lastHindiOut) && (now - lastHindiTime) < HINDI_DEDUP_MS) {
                     CaptionLogger.log(TAG, "SKIP dup Hindi")
                     // Reset enqueued state so next event with new context can enqueue
-                    lastEnqueuedFull = ""
-                    lastNorm = ""
+                    lastEnqueued = ""
+                    lastRawFull  = ""
                     continue
                 }
                 lastHindiOut  = hindi
